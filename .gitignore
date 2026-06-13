@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Runtime output
+loop_run.log
+loop_logs/
