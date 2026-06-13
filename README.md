@@ -1,139 +1,141 @@
-# LoopEngineering — 最小 Agent Loop
+# LoopEngineering — Minimal Agent Loop
 
-一个最小可运行的 agentic loop 示例：模型在 while 循环中反复「思考 → 调用工具 → 看结果」，直到给出最终答案。使用 OpenAI 兼容 API，可接 OpenAI 官方、vLLM、DeepSeek 等任何兼容 endpoint。
+> Language: **English** | [中文](README_cn.md)
 
-## 结构
+A minimal, runnable agentic-loop example: the model repeats "think → call tool → see result" inside a while loop until it produces a final answer. It uses an OpenAI-compatible API, so it works with OpenAI itself, vLLM, DeepSeek, or any compatible endpoint.
+
+## Layout
 
 ```
-agent.py    内层循环：可复用的 Agent 类（配置/工具注册/run）+ 函数式入口 run_loop()
-tools.py    工具注册表：schema（给模型看）+ Python 函数（真正执行）
-loop.sh     外层循环：反复无头调用 claude / codex / 本项目 agent.py，状态持久化在 STATE.md
-test_agent.py  内层离线单元测试（假 OpenAI 客户端，无需真实 API）
-test_e2e.sh    外层端到端测试（stub 内层 agent，验证状态注入/写回/完成标记）
+agent.py       Inner loop: a reusable Agent class (config/tool registration/run) + functional entry run_loop()
+tools.py       Tool registry: schemas (for the model) + Python functions (the real execution)
+loop.sh        Outer loop: repeatedly invokes claude / codex / this project's agent.py headless; state persisted in STATE.md
+test_agent.py  Inner offline unit tests (fake OpenAI client, no real API needed)
+test_e2e.sh    Outer end-to-end tests (stub inner agent; verifies state injection / write-back / done marker)
 ```
 
-## 可复用的 Agent 类（agent.py）
+## The reusable Agent class (agent.py)
 
-内层逻辑抽象成 `Agent` 类：配置集中在 `__init__`、工具集每实例独立、`run()` 是经典的
-「发请求 → 执行工具 → 回填结果 → 再发请求」循环。
+The inner logic is abstracted into an `Agent` class: configuration is centralized in `__init__`, the tool set is per-instance, and `run()` is the classic "send request → execute tools → feed results back → send again" loop.
 
 ```python
 from agent import Agent
 
-agent = Agent(model="gpt-4o")                 # 配置集中在构造函数
-agent.register("my_tool", my_func, my_schema) # 注册/覆盖工具（同名覆盖不重复 schema）
+agent = Agent(model="gpt-4o")                  # config centralized in the constructor
+agent.register("my_tool", my_func, my_schema)  # register/override a tool (same name overrides, no duplicate schema)
 
-answer = agent.run("帮我算 (27*453)+19")       # 普通模式：返回最终答案字符串
+answer = agent.run("compute (27*453)+19")      # normal mode: returns the final answer string
 
-for chunk in agent.run("讲讲这个项目", stream=True):  # 流式模式：逐段产出文本增量
+for chunk in agent.run("tell me about this project", stream=True):  # streaming mode: yields text deltas
     print(chunk, end="", flush=True)
 ```
 
-- **工具隔离**：实例工具集是全局注册表的拷贝，`register()` 只影响该实例，不污染全局。
-- **健壮工具错误处理**：`execute_tool` 分别处理「未知工具 / 参数非法 JSON / 参数不匹配 /
-  执行抛异常」，全部返回**可读错误串**而非抛出 —— 模型能看到错误并自我纠正，循环不崩。
-- **流式输出**：`stream=True` 时聚合 OpenAI 流式 chunk（content 实时吐出、tool_calls 按
-  index 累积）；带工具调用的轮次仍走普通请求以稳健拿到 tool_calls；底层 client 不支持
-  stream 时自动回退普通请求。CLI 亦支持 `python agent.py --stream "..."`。
-- `run_loop()` 保留为向后兼容的薄包装，内部委托 `Agent`。
+- **Tool isolation**: an instance's tool set is a copy of the global registry; `register()` affects only that instance and never pollutes the global registry.
+- **Robust tool error handling**: `execute_tool` separately handles "unknown tool / invalid-JSON arguments / argument mismatch / execution raised", and returns a **readable error string** instead of throwing — the model can see the error and self-correct, and the loop doesn't crash.
+- **Streaming output**: with `stream=True` it aggregates OpenAI streaming chunks (content is emitted live, tool_calls are accumulated by index); turns that involve tool calls still use a normal request to robustly obtain the tool_calls; if the underlying client doesn't support streaming it automatically falls back to a normal request. The CLI also supports `python agent.py --stream "..."`.
+- `run_loop()` is kept as a thin backward-compatible wrapper that delegates to `Agent`.
 
-## 外层循环（loop.sh）
+## The outer loop (loop.sh)
 
-Boris Cherny 式的 loop engineering：脚本反复调用编码 agent，每轮 agent 读 `STATE.md` 续上进度、干一步、写回状态，直到输出完成标记 `LOOP_TASK_COMPLETE` 或达到轮数上限。
+Boris Cherny-style loop engineering: the script repeatedly invokes a coding agent; each round the agent reads `STATE.md` to resume progress, does one step, and writes the state back — until it outputs the done marker `LOOP_TASK_COMPLETE` or the iteration cap is reached.
 
 ```bash
-./loop.sh "把 tools.py 里的每个工具都补上单元测试，全部通过为止"
-AGENT=codex MAX_ITERS=20 ./loop.sh "修复所有 lint 报错"
-AGENT=agent ./loop.sh "..."        # 用本项目的 agent.py 作为内层（见下）
-AGENT_CMD='my-llm --model x' ./loop.sh "..."   # 完全自定义内层调用命令
+./loop.sh "add unit tests for every tool in tools.py until they all pass"
+AGENT=codex MAX_ITERS=20 ./loop.sh "fix all lint errors"
+AGENT=agent ./loop.sh "..."        # use this project's agent.py as the inner agent (see below)
+AGENT_CMD='my-llm --model x' ./loop.sh "..."   # fully custom inner-agent command
 ```
 
-注意：脚本用了 `--dangerously-skip-permissions`（claude）/ `--full-auto`（codex）以便无人值守，只在可信目录里运行。各轮完整输出保存在 `loop_logs/`。
+Note: the script uses `--dangerously-skip-permissions` (claude) / `--full-auto` (codex) so it can run unattended — only run it in a trusted directory. Each round's full output is saved under `loop_logs/`.
 
-### 内外层共用同一套约定
+### Inner and outer share one contract
 
-外层（loop.sh）和内层（agent.py）共享**同一套契约**，所以 `loop.sh` 既能驱动 claude/codex，
-也能用 `AGENT=agent` 把本项目的 `agent.py` 当内层：
+The outer loop (loop.sh) and the inner loop (agent.py) share the **same contract**, so `loop.sh` can drive claude/codex, and with `AGENT=agent` it can also use this project's `agent.py` as the inner agent:
 
-- **状态文件**：跨轮唯一记忆是 `STATE.md`（`STATE_FILE` 可改）。外层每轮只把它拼进 prompt
-  （滚动摘要，而非全部历史），内层用 `read_file`/`write_file` 读写它。
-- **完成标记**：内层在最后**独占一行**输出 `LOOP_TASK_COMPLETE`，外层 grep 到（精确整行匹配，
-  正文句中提及不会误判）即以 0 退出。
-- **体积预算**：`STATE_MAX_BYTES`（默认 12000）给 STATE.md 设上限，超出仅告警，提醒精炼摘要。
+- **State file**: the only cross-round memory is `STATE.md` (`STATE_FILE` is configurable). Each round the outer loop splices only this into the prompt (a rolling summary, not the full history); the inner agent reads/writes it via `read_file`/`write_file`.
+- **Done marker**: the inner agent outputs `LOOP_TASK_COMPLETE` on its **own line** at the very end; the outer loop greps for it (exact whole-line match, so a mid-sentence mention won't trigger a false positive) and exits 0.
+- **Size budget**: `STATE_MAX_BYTES` (default 12000) caps STATE.md; exceeding it only warns, nudging the agent to keep the summary concise.
 
-| AGENT 值 | 内层命令 |
+| AGENT value | Inner command |
 |----------|----------|
-| `claude`（默认） | `claude -p "$prompt" --dangerously-skip-permissions` |
+| `claude` (default) | `claude -p "$prompt" --dangerously-skip-permissions` |
 | `codex` | `codex exec --full-auto "$prompt"` |
-| `agent` | `python3 agent.py "$prompt"`（本项目内层，走 OpenAI 兼容 API） |
+| `agent` | `python3 agent.py "$prompt"` (this project's inner loop, via an OpenAI-compatible API) |
 
-## 安装与运行
+#### Useful loop.sh environment variables
+
+| Variable | Purpose |
+|---|---|
+| `MAX_ITERS` | Maximum number of rounds (default 10) |
+| `ITER_TIMEOUT` | Per-round timeout in seconds, 0 = unlimited (portable impl; macOS has no `timeout`) |
+| `MODEL` | Model name passed to claude/codex |
+| `PROXY` | Inject `https_proxy`/`http_proxy` (when the CLI must reach the network via a proxy) |
+| `STATE_FILE` | Cross-round memory file (default STATE.md) |
+| `STATE_MAX_BYTES` | STATE.md size budget; exceeding it only warns |
+
+## Install and run
 
 ```bash
 pip install -r requirements.txt
 
-# OpenAI 官方
+# OpenAI official
 export OPENAI_API_KEY=sk-...
 
-# 或本地 vLLM / 其他兼容服务
+# or local vLLM / other compatible service
 export OPENAI_API_KEY=EMPTY
 export OPENAI_BASE_URL=http://localhost:8000/v1
 export MODEL=Qwen/Qwen2.5-72B-Instruct
 
-# 单次执行
-python agent.py "算一下 (27 * 453) + 19，再列出当前目录的文件"
+# single run
+python agent.py "compute (27 * 453) + 19, then list the files in the current directory"
 
-# 流式输出（逐段打印）
-python agent.py --stream "讲讲这个项目"
+# streaming output (printed incrementally)
+python agent.py --stream "tell me about this project"
 
-# 交互模式
+# interactive mode
 python agent.py
 ```
 
-## 内置工具
+## Built-in tools
 
-| 工具 | 作用 |
+| Tool | Purpose |
 |------|------|
-| `calculator` | 安全求值算术表达式（不用 `eval`） |
-| `read_file` | 读文本文件（>8000 字符截断） |
-| `list_dir` | 列目录 |
-| `write_file` | 写文件（覆盖，自动建父目录） |
-| `bash` | 在 shell 执行命令，返回 stdout/stderr + 退出码，带超时 |
-| `http_get` | 联网 HTTP(S) GET 抓取网页/API |
+| `calculator` | Safely evaluate arithmetic expressions (no `eval`) |
+| `read_file` | Read a text file (truncated past 8000 chars) |
+| `list_dir` | List a directory |
+| `write_file` | Write a file (overwrite, auto-create parent dirs) |
+| `bash` | Run a shell command, returns stdout/stderr + exit code, with timeout |
+| `http_get` | Networked HTTP(S) GET to fetch a web page / API |
 
-## 上下文窗口处理（context compression）
+## Context-window handling (context compression)
 
-模型无状态、`messages` 只增不减，多轮工具调用迟早撑爆 context window。`agent.py`：
+The model is stateless and `messages` only grows, so multi-round tool calls will eventually blow past the context window. `agent.py`:
 
-- 每轮发请求前用 `estimate_tokens()` 粗估 token（约 4 字符/token）；
-- 超过 `CONTEXT_LIMIT`（默认 12000，可用环境变量调）就调用 `compact_messages()`：
-  用模型自己把**较早的对话**总结成一条「历史摘要」system 消息，只保留 `system + 摘要 + 最近 KEEP_RECENT 条`；
-- 裁剪按**完整单元**进行，绝不把 assistant 的 `tool_calls` 与其 `role=tool` 结果拆散（否则 `tool_call_id` 不配对，API 报错）；
-- 摘要调用失败时**降级**为纯文本截断拼接，保证压缩永不崩。
+- Before each request, `estimate_tokens()` roughly estimates tokens (~4 chars/token);
+- Once it exceeds `CONTEXT_LIMIT` (default 12000, tunable via env var), `compact_messages()` runs: it asks the model to summarize the **earlier conversation** into a single "history summary" system message, keeping only `system + summary + the most recent KEEP_RECENT messages`;
+- Trimming happens by **complete unit** — it never splits an assistant's `tool_calls` from its `role=tool` results (otherwise `tool_call_id` mismatches and the API errors);
+- If the summary call fails, it **degrades** to plain text truncation so compaction never crashes.
 
-## 循环的关键设计点
+## Key loop design points
 
-1. **退出条件**：`msg.tool_calls` 为空 → 模型不再需要工具 → 返回最终答案
-2. **配对**：每个 `tool_call` 必须有一条 `role="tool"` 消息，通过 `tool_call_id` 对应，否则 API 报错
-3. **历史累积**：模型无状态，assistant 的工具请求和 tool 结果都要追加进 `messages`
-4. **安全上限**：`MAX_TURNS` 防止模型陷入无限循环
-5. **上下文压缩**：见上节，避免长任务撑爆 context window
+1. **Exit condition**: `msg.tool_calls` is empty → the model no longer needs tools → return the final answer
+2. **Pairing**: every `tool_call` must have a matching `role="tool"` message tied by `tool_call_id`, or the API errors
+3. **History accumulation**: the model is stateless, so the assistant's tool requests and the tool results must both be appended to `messages`
+4. **Safety cap**: `MAX_TURNS` prevents the model from looping forever
+5. **Context compaction**: see the section above; avoids long tasks blowing past the context window
 
-## 测试
+## Tests
 
-两套测试都离线、零外部依赖，无需真实 API：
+Both test suites are offline with zero external dependencies — no real API needed:
 
 ```bash
-python test_agent.py   # 内层单元测试：工具/循环/压缩/Agent 类/流式/错误处理（18 个）
-bash   test_e2e.sh     # 外层端到端：用 stub 内层 agent 验证 loop.sh 的状态注入/写回/完成标记
+python test_agent.py   # inner unit tests: tools/loop/compaction/Agent class/streaming/error handling (18 tests)
+bash   test_e2e.sh     # outer end-to-end: a stub inner agent verifies loop.sh's state injection/write-back/done marker
 ```
 
-- `test_agent.py` 用假 OpenAI 客户端验证内层：工具注册表、`run_loop`/`Agent.run`、上下文压缩、
-  工具错误处理、流式聚合等。
-- `test_e2e.sh` 在临时目录里用一个 stub「内层 agent」（经 `AGENT_CMD` 注入）跑真实的 `loop.sh`，
-  断言：上一轮 STATE.md 注入了 prompt、内层写回了 STATE.md、独占一行的完成标记被检测到即退出、
-  无标记则跑满轮数、句中标记不会被误判。
+- `test_agent.py` uses a fake OpenAI client to verify the inner loop: the tool registry, `run_loop`/`Agent.run`, context compaction, tool error handling, streaming aggregation, etc.
+- `test_e2e.sh` runs the real `loop.sh` in a temp directory with a stub "inner agent" (injected via `AGENT_CMD`), asserting: the previous round's STATE.md was injected into the prompt, the inner agent wrote STATE.md back, a done marker on its own line is detected and exits, no marker runs to the iteration cap, and a mid-sentence marker isn't misdetected.
 
-## 如何加新工具
+## How to add a new tool
 
-在 `tools.py` 中：写一个函数 → 注册到 `TOOL_FUNCTIONS` → 在 `TOOL_SCHEMAS` 加对应 JSON Schema。循环代码无需改动。
+In `tools.py`: write a function → register it in `TOOL_FUNCTIONS` → add the matching JSON Schema to `TOOL_SCHEMAS`. The loop code needs no changes.
